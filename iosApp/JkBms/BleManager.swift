@@ -26,6 +26,11 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var peripherals: [String: CBPeripheral] = [:]
     private var lastData = Date()
     private var watchdog: Timer?
+    private var requestedOnce = false
+    private var lastDeviceId: String? {
+        get { UserDefaults.standard.string(forKey: "lastDeviceId") }
+        set { UserDefaults.standard.set(newValue, forKey: "lastDeviceId") }
+    }
 
     override init() {
         super.init()
@@ -51,6 +56,7 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard let p = peripherals[id] else { onStatus?("设备已失效，请重新扫描"); return }
         peripheral = p
         p.delegate = self
+        lastDeviceId = id
         onStatus?("连接中…")
         central.connect(p, options: nil)
     }
@@ -58,13 +64,25 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func disconnect() {
         watchdog?.invalidate(); watchdog = nil
         if let p = peripheral { central.cancelPeripheralConnection(p) }
-        peripheral = nil; char = nil; rx.removeAll()
+        peripheral = nil; char = nil; rx.removeAll(); requestedOnce = false
         onStatus?("已断开")
     }
 
     // MARK: - Central
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
-        if c.state == .poweredOn { onStatus?("蓝牙就绪") }
+        if c.state == .poweredOn {
+            onStatus?("蓝牙就绪")
+            // 自动连上次设备（若系统缓存里有）
+            if let id = lastDeviceId, let uuid = UUID(uuidString: id), peripheral == nil {
+                let known = c.retrievePeripherals(withIdentifiers: [uuid])
+                if let p = known.first {
+                    peripheral = p
+                    p.delegate = self
+                    onStatus?("自动重连中…")
+                    c.connect(p, options: nil)
+                }
+            }
+        }
         else if c.state == .unauthorized { onStatus?("蓝牙未授权") }
         else { onStatus?("蓝牙不可用") }
     }
@@ -105,11 +123,20 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             onStatus?("未找到 0xFFE1"); return
         }
         char = ch
-        p.setNotifyValue(true, for: ch)
-        onStatus?("已连接")
-        // 只请求一次（BMS 会持续推 0x02，避免蜂鸣器一直响）
-        request()
-        startWatchdog()
+        p.setNotifyValue(true, for: ch)   // 请求在 didUpdateNotificationStateFor 里发
+        onStatus?("已连接，等待数据…")
+    }
+
+    /// 订阅（CCCD 写入）确认后再请求，避免订阅未生效时请求丢失
+    func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
+        guard ch.uuid == BleManager.charUUID else { return }
+        if let e = error { onStatus?("订阅失败：\(e.localizedDescription)"); return }
+        guard ch.isNotifying else { return }
+        if !requestedOnce {
+            requestedOnce = true
+            request()
+            startWatchdog()
+        }
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
@@ -155,9 +182,9 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     private func startWatchdog() {
         watchdog?.invalidate()
-        watchdog = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            if Date().timeIntervalSince(self.lastData) > 5 { self.request() }
+            if Date().timeIntervalSince(self.lastData) > 4 { self.request() }
         }
     }
 }
