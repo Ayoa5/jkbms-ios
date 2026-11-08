@@ -1,0 +1,65 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: iosApp
+        run: xcodegen generate
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned .app
+        working-directory: iosApp
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project JkBms.xcodeproj \
+            -scheme JkBms \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ../build/ios_dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee /tmp/xcodebuild.log | tail -40
+
+      - name: Package unsigned .ipa
+        run: |
+          set -e
+          APP="build/ios_dd/Build/Products/Release-iphoneos/JkBms.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::app not found"; tail -80 /tmp/xcodebuild.log; exit 1
+          fi
+          rm -rf build/ipa_stage
+          mkdir -p build/ipa_stage/Payload
+          cp -R "$APP" build/ipa_stage/Payload/
+          rm -rf build/ipa_stage/Payload/JkBms.app/_CodeSignature || true
+          cd build/ipa_stage
+          zip -qry JkBms_Unsigned.ipa Payload
+          ls -lh JkBms_Unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JkBms-Unsigned
+          path: build/ipa_stage/JkBms_Unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
