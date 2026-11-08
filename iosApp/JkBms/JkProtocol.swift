@@ -27,7 +27,7 @@ enum JkProtocol {
         func u32(_ i: Int) -> UInt32 {
             UInt32(frame[i]) | (UInt32(frame[i + 1]) << 8) | (UInt32(frame[i + 2]) << 16) | (UInt32(frame[i + 3]) << 24)
         }
-        func i32(_ i: Int) -> Int { Int(bitPattern: u32(i)) }
+        func i32(_ i: Int) -> Int { Int(Int32(bitPattern: u32(i))) }
         func temp(_ i: Int) -> Double {
             let raw = u16(i)
             return (raw == 0 || raw == 0xFFFF) ? 0 : Double(raw) / 10.0
