@@ -167,9 +167,8 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     authenticated = true
                     onAuth?(true)
                     onStatus?("密码通过，读取数据…")
-                    requestCellInfo()
-                    startPolling()
-                    startWatchdog()
+                    requestCellInfo()          // 只请求一次，BMS 会持续推送 0x02
+                    startWatchdog()            // 5s 无数据才补发
                 } else {
                     authenticated = false
                     onAuth?(false)
@@ -224,14 +223,15 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         sendCommand(0x96)
     }
 
-    /// 看门狗：1s 检查，3s 无数据重连
+    /// 看门狗：1s 检查，连续 5s 无数据才补发一次 0x96（低频，不蜂鸣）；不主动重连
     private func startWatchdog() {
         watchdogTimer?.invalidate()
         watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            if Date().timeIntervalSince(self.lastData) > 3 {
-                self.onStatus?("数据超时，重连…")
-                self.scheduleReconnect()
+            if Date().timeIntervalSince(self.lastData) > 5 {
+                self.onStatus?("数据中断，补发请求…")
+                self.requestCellInfo()
+                self.lastData = Date()   // 延长下一次补发间隔
             }
         }
     }
