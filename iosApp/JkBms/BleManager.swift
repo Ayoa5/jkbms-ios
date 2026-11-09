@@ -1,32 +1,40 @@
 import Foundation
 import CoreBluetooth
 
-/// CoreBluetooth 连接 JK-BMS：Service FFE0 / Char FFE1
-/// 连接后请求一次 0x97 -> 300ms -> 0x96，BMS 持续推送 0x02；5s 无数据看门狗补发。
+/// 完全照 JKBMS-Android 的 BLE 方案：
+/// 连接 → 订阅 → 0x97(仅一次) → 校验 device-info 里的设备密码(@62) → 认证后每 500ms 发 0x96 →
+/// 固定 300 字节帧 + 帧计数器(frame[16]) + 看门狗(1s/3s) + 自动重连(1.5s)
 class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
-    struct Device: Identifiable, Hashable {
-        let id: String
-        let name: String
-        let rssi: Int
-    }
+    struct Device: Identifiable, Hashable { let id: String; let name: String; let rssi: Int }
 
     static let serviceUUID = CBUUID(string: "FFE0")
     static let charUUID = CBUUID(string: "FFE1")
+    static let minFrameSize = 300
 
     var onStatus: ((String) -> Void)?
     var onData: ((BmsData) -> Void)?
     var onDevices: (([Device]) -> Void)?
+    var onAuth: ((Bool) -> Void)?
+
+    /// BLE 连接密码（device-info 的 passcode 必须与之一致）
+    var password: String = "1234"
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
-    private var char: CBCharacteristic?
-    private var rx: [UInt8] = []
+    private var writeChar: CBCharacteristic?
+    private var notifyChar: CBCharacteristic?
+    private var buffer: [UInt8] = []
+    private var frameCounter: UInt8 = 0
+    private var authenticated = false
+    private var cellRequestInFlight = false
+    private var cellRequestAt = Date()
+    private var pollTimer: Timer?
+    private var watchdogTimer: Timer?
+    private var lastData = Date()
     private var found: [String: Device] = [:]
     private var peripherals: [String: CBPeripheral] = [:]
-    private var lastData = Date()
-    private var watchdog: Timer?
-    private var requestedOnce = false
+    private var reconnectAddress: String?
     private var lastDeviceId: String? {
         get { UserDefaults.standard.string(forKey: "lastDeviceId") }
         set { UserDefaults.standard.set(newValue, forKey: "lastDeviceId") }
@@ -37,8 +45,7 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
-    var bluetoothReady: Bool { central.state == .poweredOn }
-
+    // MARK: - 扫描 / 连接
     func startScan() {
         guard central.state == .poweredOn else { onStatus?("蓝牙未就绪/未授权"); return }
         found.removeAll(); onDevices?([])
@@ -54,17 +61,17 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func connect(_ id: String) {
         central.stopScan()
         guard let p = peripherals[id] else { onStatus?("设备已失效，请重新扫描"); return }
-        peripheral = p
-        p.delegate = self
-        lastDeviceId = id
+        peripheral = p; p.delegate = self
+        lastDeviceId = id; reconnectAddress = id
         onStatus?("连接中…")
         central.connect(p, options: nil)
     }
 
     func disconnect() {
-        watchdog?.invalidate(); watchdog = nil
+        stopTimers()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
-        peripheral = nil; char = nil; rx.removeAll(); requestedOnce = false
+        peripheral = nil; writeChar = nil; notifyChar = nil
+        buffer.removeAll(); authenticated = false; reconnectAddress = nil
         onStatus?("已断开")
     }
 
@@ -72,18 +79,14 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         if c.state == .poweredOn {
             onStatus?("蓝牙就绪")
-            // 自动连上次设备（若系统缓存里有）
             if let id = lastDeviceId, let uuid = UUID(uuidString: id), peripheral == nil {
-                let known = c.retrievePeripherals(withIdentifiers: [uuid])
-                if let p = known.first {
-                    peripheral = p
-                    p.delegate = self
+                if let p = c.retrievePeripherals(withIdentifiers: [uuid]).first {
+                    peripheral = p; p.delegate = self; reconnectAddress = id
                     onStatus?("自动重连中…")
                     c.connect(p, options: nil)
                 }
             }
-        }
-        else if c.state == .unauthorized { onStatus?("蓝牙未授权") }
+        } else if c.state == .unauthorized { onStatus?("蓝牙未授权") }
         else { onStatus?("蓝牙不可用") }
     }
 
@@ -103,11 +106,14 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         onStatus?("连接失败：\(error?.localizedDescription ?? "未知")")
+        scheduleReconnect()
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        watchdog?.invalidate(); watchdog = nil
-        onStatus?("连接已断开")
+        stopTimers()
+        authenticated = false
+        onStatus?("连接已断开，准备重连…")
+        scheduleReconnect()
     }
 
     // MARK: - Peripheral
@@ -115,76 +121,133 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard let s = p.services?.first(where: { $0.uuid == BleManager.serviceUUID }) else {
             onStatus?("未找到 0xFFE0"); return
         }
-        p.discoverCharacteristics([BleManager.charUUID], for: s)
+        p.discoverCharacteristics(nil, for: s)
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
-        guard let ch = s.characteristics?.first(where: { $0.uuid == BleManager.charUUID }) else {
-            onStatus?("未找到 0xFFE1"); return
-        }
-        char = ch
-        p.setNotifyValue(true, for: ch)   // 请求在 didUpdateNotificationStateFor 里发
-        onStatus?("已连接，等待数据…")
+        guard let chs = s.characteristics else { onStatus?("无特征"); return }
+        writeChar = chs.first { $0.properties.contains(.writeWithoutResponse) || $0.properties.contains(.write) }
+        notifyChar = chs.first { $0.properties.contains(.notify) || $0.properties.contains(.indicate) } ?? writeChar
+        guard let n = notifyChar else { onStatus?("0xFFE1 不支持读写"); return }
+        p.setNotifyValue(true, for: n)
+        onStatus?("已连接，开启通知…")
     }
 
-    /// 订阅（CCCD 写入）确认后再请求，避免订阅未生效时请求丢失
+    /// 订阅确认（CCCD 成功）后：只发一次 0x97 请求设备信息（0x97 会蜂鸣，所以只发一次）
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
         guard ch.uuid == BleManager.charUUID else { return }
-        if let e = error { onStatus?("订阅失败：\(e.localizedDescription)"); return }
+        if let e = error { onStatus?("订阅失败：\(e.localizedDescription)"); scheduleReconnect(); return }
         guard ch.isNotifying else { return }
-        if !requestedOnce {
-            requestedOnce = true
-            request()
-            startWatchdog()
-        }
+        onStatus?("通知已开启，校验密码…")
+        sendCommand(0x97)
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
         guard let v = ch.value else { return }
-        feed([UInt8](v))
+        onNotify([UInt8](v))
     }
 
-    private func request() {
-        write(JkProtocol.requestDeviceInfo)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.write(JkProtocol.requestCellInfo)
+    // MARK: - 收包 / 固定 300 字节组帧
+    private func onNotify(_ chunk: [UInt8]) {
+        lastData = Date()
+        if chunk.count >= 4, chunk[0] == 0x55, chunk[1] == 0xAA, chunk[2] == 0xEB, chunk[3] == 0x90 {
+            buffer.removeAll()
+        }
+        buffer.append(contentsOf: chunk)
+        if buffer.count >= BleManager.minFrameSize {
+            let frame = Array(buffer[0..<BleManager.minFrameSize])
+            buffer.removeAll()
+            cellRequestInFlight = false
+            guard frame.count > 4 else { return }
+            switch frame[4] {
+            case 0x03:   // device info：校验设备密码(@62)
+                let passcode = parseCString(frame, 62, 16)
+                let typed = password.trimmingCharacters(in: .whitespaces)
+                if !typed.isEmpty && typed == passcode {
+                    authenticated = true
+                    onAuth?(true)
+                    onStatus?("密码通过，读取数据…")
+                    requestCellInfo()
+                    startPolling()
+                    startWatchdog()
+                } else {
+                    authenticated = false
+                    onAuth?(false)
+                    stopTimers()
+                    onStatus?("密码错误（设备密码=\(passcode)）")
+                }
+            case 0x02:   // cell info
+                guard authenticated else { return }
+                if let d = JkProtocol.parseCellInfo(frame) { onData?(d) }
+            default: break
+            }
+        } else if buffer.count > 420 {
+            buffer.removeAll()
         }
     }
 
-    private func write(_ d: Data) {
-        guard let p = peripheral, let ch = char else { return }
-        p.writeValue(d, for: ch, type: .withoutResponse)
+    private func parseCString(_ f: [UInt8], _ start: Int, _ len: Int) -> String {
+        let end = min(start + len, f.count)
+        guard start < end else { return "" }
+        let raw = Array(f[start..<end])
+        let cut = raw.firstIndex(of: 0) ?? raw.count
+        return String(decoding: raw[0..<cut], as: UTF8.self).trimmingCharacters(in: .whitespaces)
     }
 
-    private func feed(_ bytes: [UInt8]) {
-        rx.append(contentsOf: bytes)
-        while true {
-            guard let start = rx.firstIndex(of: 0x55) else {
-                if rx.count > 4096 { rx.removeAll() }
-                return
-            }
-            if start + 3 >= rx.count { if start > 0 { rx.removeFirst(start) }; return }
-            if !(rx[start + 1] == 0xAA && rx[start + 2] == 0xEB && rx[start + 3] == 0x90) {
-                rx.remove(at: start); continue
-            }
-            if start > 0 { rx.removeFirst(start) }
-            if rx.count < 6 { return }
-            let total = 7 + Int(rx[5])
-            if rx.count < total { return }
-            let frame = Array(rx[0..<total])
-            rx.removeFirst(total)
-            if let d = JkProtocol.parseCellInfo(frame) {
-                lastData = Date()
-                onData?(d)
-            }
+    // MARK: - 请求
+    private func sendCommand(_ cmd: UInt8) {
+        guard let p = peripheral, let ch = writeChar else { return }
+        var f = [UInt8](repeating: 0, count: 20)
+        f[0] = 0xAA; f[1] = 0x55; f[2] = 0x90; f[3] = 0xEB
+        f[4] = cmd; f[5] = 0x00
+        f[16] = frameCounter
+        frameCounter = frameCounter &+ 1
+        var crc: UInt8 = 0
+        for i in 0..<19 { crc = crc &+ f[i] }
+        f[19] = crc
+        p.writeValue(Data(f), for: ch, type: .withoutResponse)
+    }
+
+    /// 认证后每 500ms 请求一次 cell-info
+    private func startPolling() {
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.requestCellInfo()
         }
     }
 
+    private func requestCellInfo() {
+        let now = Date()
+        if cellRequestInFlight && now.timeIntervalSince(cellRequestAt) < 1.5 { return }
+        cellRequestInFlight = true
+        cellRequestAt = now
+        sendCommand(0x96)
+    }
+
+    /// 看门狗：1s 检查，3s 无数据重连
     private func startWatchdog() {
-        watchdog?.invalidate()
-        watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            if Date().timeIntervalSince(self.lastData) > 4 { self.request() }
+            if Date().timeIntervalSince(self.lastData) > 3 {
+                self.onStatus?("数据超时，重连…")
+                self.scheduleReconnect()
+            }
+        }
+    }
+
+    private func stopTimers() {
+        pollTimer?.invalidate(); pollTimer = nil
+        watchdogTimer?.invalidate(); watchdogTimer = nil
+    }
+
+    private func scheduleReconnect() {
+        stopTimers()
+        guard reconnectAddress != nil, let p = peripheral else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self, self.peripheral != nil else { return }
+            self.onStatus?("正在重连…")
+            self.central.connect(p, options: nil)
         }
     }
 }

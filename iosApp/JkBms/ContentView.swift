@@ -59,6 +59,19 @@ private struct ConnectPanel: View {
                 .font(.headline)
             Text("点击右上角「扫描」搜索附近的 BMS 设备，点选设备连接。")
                 .font(.footnote).foregroundStyle(gray)
+            HStack {
+                Text("蓝牙密码").font(.footnote)
+                TextField("1234", text: Binding(
+                    get: { vm.password },
+                    set: { vm.setPassword($0) }
+                ))
+                .keyboardType(.numberPad)
+                .textFieldStyle(.roundedBorder)
+                .font(.footnote)
+            }
+            if vm.authFailed {
+                Text("密码错误，请核对设备密码（默认 1234）").font(.caption2).foregroundStyle(red)
+            }
             if !vm.devices.isEmpty {
                 ForEach(vm.devices) { dev in
                     Button {
